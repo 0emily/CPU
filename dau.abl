@@ -1,0 +1,150 @@
+MODULE      DataAccess
+INTERFACE   (Accum7..Accum0, Offset7..Offset0,
+             AddrSrcSel1..AddrSrcSel0, IncDecSel1..IncDecSel0,
+             PostPreSel, OffsetEn, Reset, Clock
+            -> DataAddr7..DataAddr0, XReg7..XReg0, SReg7..SReg0);
+
+TITLE       'DAU Low-Level'
+
+
+" Description: This module is the low level for the DAU demo using the unit
+"              demo board. It contains the logic for the Data Access Unit.
+"              It muxes between XReg, SReg, and an absolute data memory address,
+"              which are either incremented, decremented, or held. A mux selects
+"              if pre- or post-incrementing/decrementing occurs. Finally, an
+"              Offset enable signal determines if an offset is added before the
+"              data access unit outputs the result as a data address bus. 
+"
+"
+" Inputs:      Accum[7..0]      - 8 bits of accumulator input
+"              Offset[7..0]     - 8 bits of data/offset input
+"              AddrSrcSel[1..0] - address source multiplexer select input
+"              IncDecSel[1..0]  - IncDec multiplexer select input
+"              PostPreSel       - PostPre multiplexer select input
+"              OffsetEn         - enables immediate offset
+"
+"              Reset            - system reset
+"              Clock            - system clock
+"
+" Outputs:
+"              DataAddr[7..0]   - 8 bits of data address bus
+
+" Revision History:
+" 03/04/26   Emily Wu  Initial revision (added equations, buses, nodes, etc.)
+" 03/05/26   Emily Wu  Fixed offset, XReg, & SReg logic; unclocked DataAddr
+" 03/11/26   Emily Wu  Got rid of ISTYPE 'REG' for DataAddr7..DataAddr0
+" 03/12/26   Emily Wu  Made reset active high for CUnit assignment
+" 03/13/26   Emily Wu  Fixed MuxOutAddrSrc select for offset (m)
+
+
+" Pin/Signal Declarations
+
+" Inputs -----------------------------------------------------------------------
+
+Accum7..Accum0        pin ISTYPE 'KEEP';        "8 bits of accumulator
+Offset7..Offset0      pin ISTYPE 'KEEP';        "8 bits of  offset
+
+AddrSrcSel1..AddrSrcSel0  pin ISTYPE 'KEEP';    "address multiplexer select
+IncDecSel1..IncDecSel0    pin ISTYPE 'KEEP';    "IncDec multiplexer select
+PostPreSel            pin ISTYPE 'KEEP';        "PostPre multiplexer select
+OffsetEn              pin ISTYPE 'KEEP';        "enables immediate offset
+
+Clock                 pin ISTYPE 'KEEP';        "input  clock
+Reset                 pin ISTYPE 'KEEP';        "input  reset
+
+" Outputs ----------------------------------------------------------------------
+
+SReg7..SReg0          pin ISTYPE 'REG, KEEP';   "8 bits of S register
+XReg7..XReg0          pin ISTYPE 'REG, KEEP';   "8 bits of X register
+DataAddr7..DataAddr0  pin ISTYPE 'KEEP';   "output 8 bit data address bus
+
+" Nodes ------------------------------------------------------------------------
+
+AndResult7..AndResult0 node;                "result of the AND
+SumID7..SumID0         node;                "handling sum for inc/dec (8 bit)
+SumOff7..SumOff0       node;                "handling sum for offset (8 bit)
+CarryID8..CarryID0     node;                "handling carry for inc/dec (9 bit)
+CarryOff8..CarryOff0   node;                "handling carry for offset (9 bit)
+
+MuxOutAddrSrc7..MuxOutAddrSrc0  pin ISTYPE 'KEEP';  "mux outputs address source
+MuxOutIncDec7..MuxOutIncDec0    pin ISTYPE 'KEEP';  "mux outputs if inc or dec
+MuxOutPostPre7..MuxOutPostPre0  pin ISTYPE 'KEEP';  "mux outputs if post or pre
+" Constants --------------------------------------------------------------------
+
+ZERO  =  [ 0, 0, 0, 0, 0, 0, 0, 0 ];    " 8-bit value of 0
+ONE   =  [ 0, 0, 0, 0, 0, 0, 0, 1 ];    " 8-bit value of 1
+NEG1  =  [ 1, 1, 1, 1, 1, 1, 1, 1 ];    " 8-bit value of -1
+
+" Buses/Vectors ----------------------------------------------------------------
+Offset         = [Offset7..Offset0];
+Accum          = [Accum7..Accum0];
+
+AndResult      = [AndResult7..AndResult0];
+
+SumID          = [SumID7..SumID0];
+SumOff         = [SumOff7..SumOff0];
+CarryInID      = [CarryID7..CarryID0];
+CarryOutID     = [CarryID8..CarryID1];
+CarryInOff     = [CarryOff7..CarryOff0];
+CarryOutOff    = [CarryOff8..CarryOff1];
+
+MuxOutAddrSrc  = [MuxOutAddrSrc7..MuxOutAddrSrc0];
+MuxOutPostPre  = [MuxOutPostPre7..MuxOutPostPre0];
+MuxOutIncDec   = [MuxOutIncDec7..MuxOutIncDec0];
+
+XReg           = [XReg7..XReg0];
+SReg           = [SReg7..SReg0];
+DataAddr       = [DataAddr7..DataAddr0];
+
+" ------------------------------------------------------------------------------
+EQUATIONS
+
+XReg.CLK = Clock;                            " use clock input for XReg
+XReg.CLR = Reset;                           " use reset input for XReg
+
+SReg.CLK = Clock;                            " use clock input for SReg
+SReg.CLR = Reset;                           " use reset input for SReg
+
+"Mux for selecting address source
+MuxOutAddrSrc  = (Offset & !AddrSrcSel0 & !AddrSrcSel1) #   " AddrSrcSel=00 -> m
+                 (XReg & !AddrSrcSel0 & AddrSrcSel1)  #   " AddrSrcSel=01 -> X
+                 (SReg & AddrSrcSel0 & !AddrSrcSel1);     " AddrSrcSel=10 -> S
+
+"Mux for selecting if increment +1, decrement -1, or nothing 0 occurs
+MuxOutIncDec   = (ZERO & !IncDecSel0 & !IncDecSel1)   #   " IncDecSel=00 -> 0
+                 (ONE & !IncDecSel0 & IncDecSel1)     #   " IncDecSel=01 -> 1
+                 (NEG1 & IncDecSel0 & IncDecSel1);        " IncDecSel=11 -> -1
+
+"Incrementer/Decrement logic
+CarryID0     =  0;
+SumID        =  (MuxOutIncDec $ MuxOutAddrSrc) $ CarryInID;
+CarryOutID   =  ((MuxOutIncDec $ MuxOutAddrSrc) & CarryInID)
+              # (MuxOutIncDec & MuxOutAddrSrc);
+
+"Mux for selecting if pre or post increment/decrement occurs
+MuxOutPostPre  = (MuxOutAddrSrc & PostPreSel) # " PostPre=1 -> Post/adder result
+                 (SumID & !PostPreSel);         " PostPre=0 -> Pre/address src
+
+"OffsetEn is used to decide whether offset is added to MuxOutPostPre
+AndResult =  OffsetEn & Offset;
+
+"Logic for adding offset
+CarryOff0     =  0;
+SumOff        =  (AndResult $ MuxOutPostPre) $ CarryInOff;
+CarryOutOff   =  ((AndResult $ MuxOutPostPre) & CarryInOff)
+               # (AndResult & MuxOutPostPre);
+
+"XReg is set to the result of the inc/dec sum if it is the address source
+      "otherwise, it maintains its current value
+"SReg is set to the result of the offset sum if it is the address source
+      "otherwise, it maintains its current value
+XReg     :=  (SumID & !AddrSrcSel0 & AddrSrcSel1)
+              # (XReg & !(!AddrSrcSel0 & AddrSrcSel1));
+SReg     :=  (SumID & AddrSrcSel0 & !AddrSrcSel1)
+              # (SReg & !(AddrSrcSel0 & !AddrSrcSel1));
+
+"the data address bus is the result of the offset sum result
+DataAddr =  SumOff;
+
+
+END DataAccess

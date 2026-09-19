@@ -1,0 +1,2417 @@
+MODULE      ControlUnit
+INTERFACE   (Reset, Clock, Flags7..Flags0, ProgramDB15..ProgramDB0
+            -> RD, WR, IO, IR15..IR0, ALUSel, DDBSel1..DDBSel0, PAUSel,
+             
+            Load, Sel2..Sel0,
+             
+            Op3..Op0, OpAdd, Subtract, CarrySel1..CarrySel0, Hold, 
+            POPF, prevCarryFlag, FlagsEn,
+             
+            AddrSrcSel1..AddrSrcSel0, IncDecSel1..IncDecSel0, 
+            PostPreSel, OffsetEn);
+
+TITLE       'Control Unit Low-Level'
+
+
+" Description:  This module is the low level file for the Caltech10 CPU control
+"               unit. It takes inputs from reset, clock, the Program Data Bus,  
+"               and flags from the algorithmic logic unit (ALU). 
+"               It outputs read, write, IO, and control signals for the ALU,
+"               data memory unit (DAU), and program memory unit (PAU). It 
+"               outputs the instruction register bus, whose bits may dictate 
+"               what operations are performed, as well as at which addresses. 
+"               Finally, it outputs multiplexer select signals that determine
+"               inputs to the ALU, data data bus, and PAU. This version has a
+"               finite state machine to implement the multi-clock CALL and RTS
+"               operations.
+"
+"
+" Inputs:      Reset            - system reset
+"              Clock            - system clock
+"              Flags[7..0]      - the 8-bit flag register
+"              ProgramDB[15..0] - the 16-bit program data bus
+"
+" Outputs:
+"              RD               - read signal
+"              WR               - write signal
+"              IO               - I/O signal (always inactive - not doing EC)
+"              IR[15..0]        - output 16-bit instruction register
+"              ALUSel           - output source select signal for ALU input mux
+"              DDBSel[1..0]     - output source select signal for DDB input mux
+"              PAUSel           - output source select signal for PAU input mux
+"
+"              Load             - PAU load signal (active low)
+"              Sel[2..0]        - PAU internal multiplexer select input
+"
+"              Op[3..0]         - ALU AB internal multiplexer select input
+"              OpAdd            - controls if the adder receives A
+"              CarrySel[1..0]   - multiplexer select input for carry mux
+"              Subtract         - controls if subtraction occurs
+"              Hold             - controls if accumulator holds previous value
+"              POPF             - input POPF signal (load data to flags)
+"              prevCarryFlag    - controls if previous carry flag value is used
+"              FlagsEn          - controls if flags are held or changed
+"
+"              AddrSrcSel[1..0] - DAU address src multiplexer select input
+"              IncDecSel[1..0]  - IncDec multiplexer select input
+"              PostPreSel       - PostPre multiplexer select input
+"              OffsetEn         - enables immediate offset
+
+" Revision History:
+" 03/10/26   Emily Wu  Initial revision (added buses for operation instructions)
+" 03/11/26   Emily Wu  Added constants for operations & WHEN-THEN statements
+" 03/12/26   Emily Wu  fixed ctrl signal bus bit orders, fixed Offset for STD
+" 03/14/26   Emily Wu  fixed PAU_CTRL, OffsetEn for PUSHF/POPF
+" 03/15/26   Emily Wu  added IR9 to BranchCond to distinguish some jumps
+" 03/16/26   Emily Wu  Wrote finite state machine for CALL and RTS instructions
+" 03/18/26   Emily Wu  Added when {} statements to states of FSM
+" 03/19/26   Emily Wu  Updated comments
+
+
+
+" Pin/Signal Declarations
+
+" Inputs -----------------------------------------------------------------------
+
+Clock                    pin ISTYPE 'KEEP';         "input  clock
+Reset                    pin ISTYPE 'KEEP';         "input  reset
+Flags7..Flags0           pin ISTYPE 'REG, KEEP';    "8 bit flag bus
+ProgramDB15..ProgramDB0  pin ISTYPE 'REG, KEEP';    "16 bit program data bus
+
+" Outputs ----------------------------------------------------------------------
+
+RD                    pin ISTYPE 'KEEP';        "read signal
+WR                    pin ISTYPE 'KEEP';        "write signal
+IO                    pin ISTYPE 'KEEP';        "I/O signal
+IR15..IR0             pin ISTYPE 'REG, KEEP';   "16 bit instruction register
+
+"PAU inputs
+Sel2                  pin ISTYPE 'KEEP';    "input  mux select 2
+Sel1                  pin ISTYPE 'KEEP';    "input  mux select 1
+Sel0                  pin ISTYPE 'KEEP';    "input  mux select 0
+Load                  pin ISTYPE 'KEEP';    "input  load signal (active low)
+
+"ALU inputs
+Op3..Op0              pin ISTYPE 'KEEP';    "input muxAB select
+OpAdd                 pin ISTYPE 'KEEP';    "controls if the adder receives A
+Subtract              pin ISTYPE 'KEEP';    "controls if a subtraction occurs
+
+CarrySel1..CarrySel0  pin ISTYPE 'KEEP';    "input MuxOutCarry select
+
+Hold                  pin ISTYPE 'KEEP';    "controls if the accumulator holds
+POPF                  pin ISTYPE 'KEEP';    "input popf flag
+prevCarryFlag         pin ISTYPE 'KEEP';    "input using prev carry flag
+FlagsEn               pin ISTYPE 'KEEP';    "input  enable change flags
+
+"DAU inputs
+AddrSrcSel1..AddrSrcSel0  pin ISTYPE 'KEEP';    "address multiplexer select
+IncDecSel1..IncDecSel0    pin ISTYPE 'KEEP';    "IncDec multiplexer select
+PostPreSel                pin ISTYPE 'KEEP';    "PostPre multiplexer select
+OffsetEn                  pin ISTYPE 'KEEP';    "enables immediate offset
+
+"Mux source selects for top level file
+ALUSel                pin ISTYPE 'KEEP';    "input ALU multiplexer select
+DDBSel1..DDBSel0      pin ISTYPE 'KEEP';    "input DAU multiplexer select
+PAUSel                pin ISTYPE 'KEEP';    "input PAU multiplexer select
+
+
+
+" Nodes ------------------------------------------------------------------------
+
+C                 node;       "Carry flag
+V                 node;       "Overflow flag
+S                 node;       "Sign flag
+Z                 node;       "Zero flag
+BranchEn          node;       "high when flag conditions for jumps are met
+HoldIR            node;       "source select signal for IR mux
+MuxIR15..MuxIR0   node;       "decides btwn current IR or new IR from ProgramDB
+
+
+" Constants --------------------------------------------------------------------
+
+PAU_INC   = [0, 0, 0, 0];                        "increment
+PAU_HOLD  = [0, 0, 0, 1];                        "hold  
+PAU_REL   = [0, 0, 1, 0];                        "relative jump
+PAU_DIR   = [1, 0, 1, 1];                        "direct jump
+PAU_LRTS  = [1, 1, 1, 0];                        "low RTS PAU
+PAU_HRTS  = [1, 1, 1, 1];                        "high RTS
+
+ALU_C0    = [0, 0];                              "carry 0
+ALU_NOTC  = [0, 1];                              "carry !C
+ALU_C     = [1, 0];                              "carry C
+ALU_C1    = [1, 1];                              "carry 1
+ALU_F0    = [0, 0, 0, 0];                        "Fblock -> 0
+ALU_FNOTA = [0, 0, 1, 1];                        "Fblock -> !A
+ALU_FNOTB = [0, 1, 0, 1];                        "Fblock -> !B
+ALU_FXOR  = [0, 1, 1, 0];                        "Fblock -> XOR
+ALU_FAND  = [1, 0, 0, 0];                        "Fblock -> AND
+ALU_FOR   = [1, 1, 1, 0];                        "Fblock -> OR
+ALU_F1    = [1, 1, 1, 1];                        "Fblock -> 1
+ALU_FB    = [1, 0, 1, 0];                        "Fblock -> B
+ALU_FA    = [1, 1, 0, 0];                        "Fblock -> A
+
+DAU_m     = [0, 0];                              "DAU address source = m
+DAU_X     = [0, 1];                              "DAU address source = X
+DAU_S     = [1, 0];                              "DAU address source = S
+DAU_0     = [0, 0];                              "DAU holds
+DAU_1     = [0, 1];                              "DAU increment 1
+DAU_NEG1  = [1, 1];                              "DAU decrement 1
+
+" Buses/Vectors ----------------------------------------------------------------
+
+BranchCond = [IR13, IR12, IR10, IR9];            "These bits can identify jumps
+
+"Buses are set to the constants above when applicable for some operations
+PAU_CTRL  = [Load, Sel2, Sel1, Sel0];            "controls program access unit
+ALU_CARRY = [CarrySel0, CarrySel1];              "determines carry-in for ALU
+ALU_FBLOCK= [Op3..Op0];                          "determines ALU f-block output
+DAU_ADDR  = [AddrSrcSel0, AddrSrcSel1];          "determines DAU address source
+DAU_INCDEC= [IncDecSel0, IncDecSel1];            "determines if DAU incs or decs
+
+IR        = [IR15..IR0];                         "16 bit instruction register
+ProgramDB = [ProgramDB15..ProgramDB0];           "16 bit program data bus
+MuxIR     = [MuxIR15..MuxIR0];                   "16 bit mux IR output
+" Instruction Set
+
+" ALU Instructions 
+ADC_m   = [0, 1, 1, 0, 0, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADC_Xo  = [0, 1, 1, 0, 0, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADC_So  = [0, 1, 1, 0, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADCI    = [0, 1, 1, 0, 0, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADD_m   = [0, 1, 1, 0, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADD_Xo  = [0, 1, 1, 0, 1, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADD_So  = [0, 1, 1, 0, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ADDI    = [0, 1, 1, 0, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+AND_m   = [0, 1, 0, 0, 0, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+AND_Xo  = [0, 1, 0, 0, 0, 1, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+AND_So  = [0, 1, 0, 0, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ANDI    = [0, 1, 0, 0, 0, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+CMP_m   = [0, 0, 1, 1, 0, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+CMP_Xo  = [0, 0, 1, 1, 0, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+CMP_So  = [0, 0, 1, 1, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+CMPI    = [0, 0, 1, 1, 0, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+DEC     = [0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+INC     = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+LSL     = [0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+NOT     = [0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+OR_m    = [0, 1, 1, 1, 0, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+OR_Xo   = [0, 1, 1, 1, 0, 1, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+OR_So   = [0, 1, 1, 1, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ORI     = [0, 1, 1, 1, 0, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+RLC     = [0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+SBB_m   = [0, 0, 0, 1, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+SBB_Xo  = [0, 0, 0, 1, 1, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+SBB_So  = [0, 0, 0, 1, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+SBBI    = [0, 0, 0, 1, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+SUB_m   = [0, 0, 0, 1, 0, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+SUB_Xo  = [0, 0, 0, 1, 0, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+SUB_So  = [0, 0, 0, 1, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+SUBI    = [0, 0, 0, 1, 0, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+TST_m   = [0, 1, 0, 0, 1, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+TST_Xo  = [0, 1, 0, 0, 1, 1, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+TST_So  = [0, 1, 0, 0, 1, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+TSTI    = [0, 1, 0, 0, 1, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+XOR_m   = [0, 0, 1, 1, 0, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+XOR_Xo  = [0, 0, 1, 1, 0, 1, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+XOR_So  = [0, 0, 1, 1, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+XORI    = [0, 0, 1, 1, 0, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+
+" Load and Store Instructions
+LDI     = [1, 0, 0, 0, 1, 0, 0, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+LDD     = [1, 0, 0, 0, 0, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_X    = [1, 0, 0, 1, 0, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_Xinc = [1, 0, 0, 1, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_Xdec = [1, 0, 0, 1, 1, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_incX = [1, 0, 0, 0, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_decX = [1, 0, 0, 0, 1, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_S    = [1, 0, 0, 1, 0, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_Sinc = [1, 0, 0, 1, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_Sdec = [1, 0, 0, 1, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_incS = [1, 0, 0, 0, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+LD_decS = [1, 0, 0, 0, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+STD     = [1, 0, 1, 0, 0, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_X    = [1, 0, 1, 1, 0, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_Xinc = [1, 0, 1, 1, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_Xdec = [1, 0, 1, 1, 1, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_incX = [1, 0, 1, 0, 0, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_decX = [1, 0, 1, 0, 1, 1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_S    = [1, 0, 1, 1, 0, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_Sinc = [1, 0, 1, 1, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_Sdec = [1, 0, 1, 1, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_incS = [1, 0, 1, 0, 0, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+ST_decS = [1, 0, 1, 0, 1, 0, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+
+" Branch Instructions
+JMP = [1, 1, 0, .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X.];
+JA  = [1, 0, 0, 0, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JAE = [1, 0, 0, 0, 1, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JB  = [1, 0, 0, 0, 1, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JBE = [1, 0, 0, 0, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JE  = [1, 0, 0, 1, 1, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JG  = [1, 0, 1, 0, 1, 1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JGE = [1, 0, 1, 1, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JL  = [1, 0, 1, 1, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JLE = [1, 0, 1, 0, 1, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JNE = [1, 0, 0, 1, 1, 1, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JNS = [1, 0, 0, 1, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JNV = [1, 0, 1, 0, 1, 0, 0, 0, .X., .X., .X., .X., .X., .X., .X., .X.];
+JS  = [1, 0, 0, 1, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+JV  = [1, 0, 1, 0, 1, 0, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X.];
+
+" Subroutine and Stack Instructions
+POPFbus  =  [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+PUSHF =  [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+CALL=[1, 1, 1, .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X., .X.];
+RTS      =  [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+
+" Miscellaneous Instructions
+NOP   =  [0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+
+" Finite state machine for CALL, RTS--------------------------------------------
+State3..State1   pin ISTYPE 'REG, KEEP';
+
+StateBits = [State3..State1];
+
+" define the states
+Default   = [0, 0, 0];              "single-clock operations
+Call1     = [0, 1, 0];              "S <- S-1; (S) <- (PC+1) 12:8;
+Call2     = [1, 1, 0];              "S <- S-1; (S) <- (PC+1) 7:0;
+Call3     = [1, 0, 0];              "PC <- a
+RTS1      = [0, 1, 1];              "PC 7:0 <- (S); S <- S+1;
+RTS2      = [1, 1, 1];              "PC 12:8 <- (S); S <- S+1;
+
+" ------------------------------------------------------------------------------
+EQUATIONS
+
+IR.CLK = Clock;                           " use clock input for instr register
+IR.CLR = Reset;                           " use reset input for instr register
+
+"mux for holding IR during multi-clock instructions (CALL, RTS)
+MuxIR    =  (IR & HoldIR) #               " HoldIR=1 -> instruction register
+            (ProgramDB & !HoldIR);        " HoldIR=0 -> ProgramDB value
+
+IR           := MuxIR;                    " IR clocked to ProgramDB or IR
+StateBits.CLK = Clock;                    " use clock input for statebits
+StateBits.CLR = Reset;                    " use reset input for statebits
+
+STATE_DIAGRAM      StateBits              " Moore state machine definition
+
+" define transitions
+STATE   Default:
+    IF       (IR == CALL) THEN Call1 with {HoldIR   = 1;
+                                           PAU_CTRL = PAU_HOLD;}
+    ELSE IF  (IR == RTS)  THEN RTS1 with  {HoldIR   = 1;
+                                           PAU_CTRL = PAU_LRTS;
+                                           WR = 0;}
+    ELSE     Default;
+
+" Hold PC, accum, and IR; pre-decrement S and pass PC12:8 to DDB
+STATE   Call1:
+    PAU_CTRL   = PAU_HOLD;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    DDBSel0    = 1;
+    DDBSel1    = 1;
+    PAUSel     = 0;
+    FlagsEn    = 0;
+    HoldIR     = 1;
+
+    GOTO Call2 with {WR = 1;}
+
+" Hold PC, accum, and IR; pre-decrement S and pass PC7:0 to DDB
+" Goes to Call3 with PC set to direct jump
+STATE   Call2:
+    PAU_CTRL   = PAU_HOLD;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 1;
+    PAUSel     = 0;
+    FlagsEn    = 0;
+    HoldIR     = 1;
+
+    GOTO Call3 with {PAU_CTRL = PAU_DIR;    "jump
+                     HoldIR = 1;
+                     WR = 0;}
+
+" Same control signals as JMP, except direct jump was set in Call2
+STATE   Call3:
+    ALUSel     = 0;
+    PAUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    FlagsEn    = 0;
+    HoldIR     = 1;
+
+    GOTO Default with {PAU_CTRL = PAU_INC; 
+                       HoldIR=0;
+                       WR = 0;} 
+
+" PC7:0 <- (S); post increment S
+STATE   RTS1:
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 1;
+    PAUSel     = 1;
+    FlagsEn    = 0;
+    HoldIR     = 1;
+
+    GOTO RTS2 with {PAU_CTRL = PAU_HRTS;}
+
+" PC12:8 <- (S); post increment S 
+STATE   RTS2:
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    ALUSel     = 0;
+    DDBSel0    = 1;
+    DDBSel1    = 1;
+    PAUSel     = 1;
+    FlagsEn    = 0;
+    HoldIR     = 1;
+
+    GOTO Default with {PAU_CTRL = PAU_INC; 
+                       HoldIR=0; 
+                       RD = 0;} 
+
+EQUATIONS
+
+
+"Generate branch enable from opcode (taken from lecture, modified slightly)
+C = Flags3;                               "Carry flag
+V = Flags2;                               "Overflow flag
+S = Flags1;                               "Sign flag
+Z = Flags0;                               "Zero flag
+
+"Each combination of bits corresponds to a jump instruction;
+" checks if the flags are correct for the specific type of jump to occur
+BranchEn = (
+      ((BranchCond == [0, 0, 0, 1])   & (C # Z))       # "JBE
+      ((BranchCond == [0, 0, 0, 0])   & (!C & !Z))     # "JA
+      ((BranchCond == [0, 0, 1, 1])   & C)             # "JB/JC
+      ((BranchCond == [0, 0, 1, 0])   & !C)            # "JAE/JNC
+      ((BranchCond == [0, 1, 0, 1])   &  S)            # "JS
+      ((BranchCond == [0, 1, 0, 0])   & !S)            # "JNS
+      ((BranchCond == [0, 1, 1, 1])   &  Z)            # "JE/JZ
+      ((BranchCond == [0, 1, 1, 0])   & !Z)            # "JNE/JNZ
+      ((BranchCond == [1, 0, 0, 1])   &  V)            # "JV
+      ((BranchCond == [1, 0, 0, 0])   & !V)            # "JNV
+      ((BranchCond == [1, 0, 1, 1])   & !((V $ S) # Z))# "JG
+      ((BranchCond == [1, 0, 1, 0])   & ((V $ S) # Z)) # "JLE
+      ((BranchCond == [1, 1, 0, 1])   & !(V $ S))      # "JGE
+      ((BranchCond == [1, 1, 0, 0])   & (V $ S))         "JL
+);
+
+"Check for when the instruction register matches an operation in the instruction
+" set, and assigns the appropriate control signal values for the PAU, DAU, & ALU 
+WHEN (IR == ADC_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADC_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADC_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADCI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADD_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADD_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADD_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ADDI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == AND_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == AND_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == AND_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ANDI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == CMP_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 1;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == CMP_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 1;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == CMP_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 1;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == CMPI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 1;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == DEC) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F1;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == INC) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == LSL) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == NOT) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_FBLOCK = ALU_FNOTA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    CarrySel0  = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == OR_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FOR;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == OR_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FOR;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == OR_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FOR;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == ORI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FOR;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == RLC) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SBB_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_NOTC;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SBB_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_NOTC;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SBB_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_NOTC;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SBBI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_NOTC;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 1;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SUB_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SUB_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SUB_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == SUBI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C1;
+    ALU_FBLOCK = ALU_FNOTB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 1;
+    Hold       = 0;
+    Subtract   = 1;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == TST_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == TST_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == TST_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == TSTI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FAND;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == XOR_m) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FXOR;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == XOR_Xo) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FXOR;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == XOR_So) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FXOR;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == XORI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FXOR;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == LDI) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 1;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LDD) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_X) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_Xinc) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_Xdec) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_incX) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_decX) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_S) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_Sinc) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_Sdec) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_incS) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == LD_decS) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 0;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == STD) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_X) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_Xinc) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_Xdec) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_incX) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_decX) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_X;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_S) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_Sinc) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_Sdec) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 1;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_incS) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == ST_decS) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 1;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == POPFbus) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_1;
+    PostPreSel = 1;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 1;
+    prevCarryFlag = 0;
+    RD         = 1;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 1;
+}
+
+WHEN (IR == PUSHF) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_F0;
+    DAU_ADDR   = DAU_S;
+    DAU_INCDEC = DAU_NEG1;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 1;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0     = 1;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == NOP) THEN {
+    PAU_CTRL   = PAU_INC;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FB;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;
+}
+
+WHEN (IR == JA) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JAE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JB) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JBE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0; 
+    ALUSel     = 0;
+    PAUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    FlagsEn    = 0;  
+}
+
+WHEN (IR == JG) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JGE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JL) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JLE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JNE) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    ALUSel     = 0;
+    PAUSel     = 0;
+    FlagsEn    = 0;      
+}
+
+WHEN (IR == JNS) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JNV) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JS) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JV) THEN {
+    WHEN (BranchEn) THEN {
+      PAU_CTRL   = PAU_REL;
+      ALUSel     = 0;
+      PAUSel     = 0;
+    }
+    ELSE {
+      PAU_CTRL=PAU_INC;
+    }
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+WHEN (IR == JMP) THEN {
+    PAU_CTRL   = PAU_DIR;
+    ALUSel     = 0;
+    PAUSel     = 0;
+    DDBSel0    = 0;
+    DDBSel1    = 0;
+    ALU_CARRY  = ALU_C0;
+    ALU_FBLOCK = ALU_FA;
+    DAU_ADDR   = DAU_m;
+    DAU_INCDEC = DAU_0;
+    PostPreSel = 0;
+    OffsetEn   = 0;
+    OpAdd      = 0;
+    Hold       = 1;
+    Subtract   = 0;
+    POPF       = 0;
+    prevCarryFlag = 0;
+    RD         = 0;
+    WR         = 0;
+    IO         = 0;
+    HoldIR     = 0;
+    FlagsEn    = 0;   
+}
+
+
+
+END ControlUnit

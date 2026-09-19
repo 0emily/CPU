@@ -1,0 +1,108 @@
+MODULE      ProgramAccess
+INTERFACE   (Offset7..Offset0, Direct12..Direct0,
+             Load, Sel2..Sel0, Reset, Clock
+            -> ProgAddr12..ProgAddr0, PC12..PC0);
+
+TITLE       'Program Address Unit Logic'
+
+
+" Description: This module is the bottom level for the demo using the unit demo 
+"              board. It contains the logic for updating the program counter. 
+"
+" Inputs:      Offset[7..0]     - 8 bits of offset input
+"              Direct[12..0]    - 13 bits of address input
+"              Load             - load signal (active low)
+"              Sel[2..0]        - multiplexer select input
+"              Reset            - system reset
+"              Clock            - system clock
+"
+" Outputs:
+"              ProgAddr[12..0]  - 13 bits of program address output
+"              PC[12..0]        - 13 bits of program counter output
+
+" Revision History:
+" 02/20/26   Emily Wu  Initial Revision
+" 02/21/26   Emily Wu  added ISTYPE KEEP; fixed mux and adder logic
+" 03/12/26   Emily Wu  Made reset active high for CUnit assignment
+
+
+" Pin/Signal Declarations
+
+" Inputs -----------------------------------------------------------------------
+
+Offset7..Offset0      pin ISTYPE 'KEEP';    "8 bits of data or offset
+Direct12..Direct0     pin ISTYPE 'KEEP';    "13 bits of address or data
+
+Sel2                  pin ISTYPE 'KEEP';    "input  mux select 2
+Sel1                  pin ISTYPE 'KEEP';    "input  mux select 1
+Sel0                  pin ISTYPE 'KEEP';    "input  mux select 0
+Load                  pin ISTYPE 'KEEP';    "input  load signal (active low)
+
+Clock                 pin ISTYPE 'KEEP';    "input  clock
+Reset                 pin ISTYPE 'KEEP';    "input  reset
+
+" Outputs ----------------------------------------------------------------------
+
+PC12..PC0          pin ISTYPE 'REG, KEEP';  "output 13 bit program counter bus
+ProgAddr12..ProgAddr0   pin ISTYPE 'KEEP';  "output 13 bit program address bus
+
+" Nodes ------------------------------------------------------------------------
+
+Sum12..Sum0             node;   "handling sum (13 bit)
+Carry13..Carry0         node;   "handling carry in and out (14 bit)
+
+MuxOut12..MuxOut0       pin ISTYPE 'KEEP';    "output  13-bit output of 1st mux
+
+" Constants --------------------------------------------------------------------
+
+ZERO  =  [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];    " 13-bit value of 0
+ONE   =  [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 ];    " 13-bit value of 1
+
+" Buses/Vectors ----------------------------------------------------------------
+
+MuxOut     =  [MuxOut12..MuxOut0];         " multiplexer output
+PC         =  [PC12..PC0];                 " program counter
+
+increment   =  ONE;                        " input INCREMENT to mux
+hold        =  ZERO;                       " input HOLD to mux
+relative    =  [Offset7, Offset7,
+                Offset7, Offset7,
+                Offset7,
+                Offset7..Offset0];         " input RELATIVE JUMP to mux
+direct      =  [Direct12..Direct0];        " input DIRECT JUMP to mux
+lRTS        =  [PC12..PC8,                 " input RTS LOW BITS to mux
+                Offset7..Offset0];
+hRTS        =  [Offset4..Offset0,          " input RTS HIGH BITS to mux
+                PC7..PC0];
+
+Sum       = [Sum12..Sum0];
+CarryIn   = [Carry12..Carry0];
+CarryOut  = [Carry13..Carry1];
+
+ProgAddr  = [ProgAddr12..ProgAddr0];
+
+" ------------------------------------------------------------------------------
+EQUATIONS
+
+PC.CLK = Clock;                            " use clock input
+PC.CLR = Reset;                           " use reset input
+
+
+"a 6:1 mux. Load signal is indicated by L0 (load is 0), L1 (load is 1)
+MuxOut  = (increment & !Sel2 & !Sel1 & !Sel0) #    " Sel = 000 increment    L0
+          (hold      & !Sel2 & !Sel1 & Sel0) #     " Sel = 001 hold         L0
+          (relative  & !Sel2 & Sel1 & !Sel0) #     " Sel = 010 relative jmp L0
+          (direct    & !Sel2 & Sel1 &  Sel0) #     " Sel = 011 direct jmp   L1
+          (lRTS      & Sel2 & Sel1 & !Sel0) #      " Sel = 110 RTS low      L1
+          (hRTS      & Sel2 & Sel1 & Sel0);        " Sel = 111 RTS high     L1
+
+
+
+Carry0    =  0;                              "nothing carried into lowest bit
+Sum       =  ((PC & !Load) $ MuxOut) $ CarryIn;
+CarryOut  =  ((((PC & !Load) $ MuxOut) & CarryIn)) # (MuxOut & (PC & !Load));
+
+PC        := Sum;                            "colon because PC is clocked
+ProgAddr  = PC;
+
+END ProgramAccess

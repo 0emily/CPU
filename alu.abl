@@ -1,0 +1,171 @@
+MODULE      ALU
+INTERFACE   (B7..B0, A7..A0,
+             Op3..Op0, OpAdd, Subtract,
+             CarrySel1..CarrySel0,
+             Hold, POPF, prevCarryFlag, Reset, Clock, FlagsEn
+            -> Accum7..Accum0, Flags7..Flags0);
+
+TITLE       'ALU Low-Level'
+
+
+" Description: This module is the low level for the ALU demo using the unit
+"              demo board. It contains the logic for the Arithmetic Logic Unit.
+"              It muxes inputs from the accumulator and data/offset registers
+"              to an adder and a flag calculator to generate flags and update
+"              the accumulator based on operations specified by control signals.
+"
+" Inputs:      B[12..0]         - 8 bits of data input
+"              A[7..0]          - 8 bits of accumulator input
+"              Op[3..0]         - AB multiplexer select input
+"              OpAdd            - controls if the adder receives A
+"              CarrySel[1..0]   - multiplexer select input for carry mux
+"              Subtract         - controls if subtraction occurs
+"              Hold             - controls if accumulator holds previous value
+"              POPF             - input POPF signal (load data to flags)
+"              prevCarryFlag    - controls if previous carry flag value is used
+"              FlagsEn          - controls if flags are held or changed
+"
+"              Reset            - system reset
+"              Clock            - system clock
+"
+" Outputs:
+"              Accum[7..0]      - 8 bits of accumulator
+"              Flags[7..0]      - 8 bits of flag output
+
+
+" Revision History:
+" 02/24/26   Emily Wu  Initial revision; added equations for setting flags
+" 02/28/26   Emily Wu  Added inputs/outputs/buses/nodes and logic equations
+" 03/01/26   Emily Wu  Revised comments; added LDD
+" 03/02/26   Emily Wu  Fixed overflow
+" 03/03/26   Emily Wu  Updated MuxOutCarry
+" 03/12/26   Emily Wu  Made reset active high for CUnit assignment
+" 03/14/26   Emily Wu  Added KeepF node, added logic for Flags7, Flags5
+" 03/15/26   Emily Wu  Changed flag logic; diff Carryflag for RLC; removed KeepF
+
+
+" Pin/Signal Declarations
+
+" Inputs -----------------------------------------------------------------------
+
+B7..B0                pin ISTYPE 'KEEP';    "8 bits of data (B)
+A7..A0                pin ISTYPE 'KEEP';    "8 bits of accumulator (A)
+
+Op3..Op0              pin ISTYPE 'KEEP';    "input muxAB select
+OpAdd                 pin ISTYPE 'KEEP';    "controls if the adder receives A
+Subtract              pin ISTYPE 'KEEP';    "controls if a subtraction occurs
+
+CarrySel1..CarrySel0  pin ISTYPE 'KEEP';    "input MuxOutCarry select
+
+Hold                  pin ISTYPE 'KEEP';    "controls if the accumulator holds
+POPF                  pin ISTYPE 'KEEP';    "input popf flag
+prevCarryFlag         pin ISTYPE 'KEEP';    "input using prev carry flag
+FlagsEn               pin ISTYPE 'KEEP';    "input  enable change flags
+
+"Interrupt             pin ISTYPE 'KEEP';    input interrupt flag
+"User                  pin ISTYPE 'KEEP';    input user flag
+
+Clock                 pin ISTYPE 'KEEP';    "input  clock
+Reset                 pin ISTYPE 'KEEP';    "input  reset
+
+" Outputs ----------------------------------------------------------------------
+
+Accum7..Accum0        pin ISTYPE 'REG, KEEP';    "output 8 bit accumulator bus
+Flags7..Flags0        pin ISTYPE 'REG, KEEP';    "output 8 bit flag bus
+
+" Nodes ------------------------------------------------------------------------
+CarryFlag              node;                "flag indicating a carry
+ZeroFlag               node;                "flag indicating a zero
+Overflow               node;                "flag indicating an overflow
+Sign                   node;                "flag indicating sign
+
+
+AndResult7..AndResult0 node;                "result of the AND
+Sum7..Sum0             node;                "handling sum (8 bit)
+Carry8..Carry0         node;                "handling carry in and out (9 bit)
+
+MuxOutAB7..MuxOutAB0   pin ISTYPE 'KEEP';      "output 8 bits of AB mux
+MuxOutCarry            pin ISTYPE 'KEEP';      "output 8 bits of carry mux
+MuxOutAccum7..MuxOutAccum0 pin ISTYPE 'KEEP';  "output 8 bits of hold accum mux
+
+
+" Buses/Vectors ----------------------------------------------------------------
+A              = [A7..A0];
+B              = [B7..B0];
+
+Accum          = [Accum7..Accum0];
+Flags          = [Flags7..Flags0];
+AndResult      = [AndResult7..AndResult0];
+
+Sum            = [Sum7..Sum0];
+CarryIn        = [Carry7..Carry0];
+CarryOut       = [Carry8..Carry1];
+
+MuxOutAB       = [MuxOutAB7..MuxOutAB0];
+MuxOutAccum    = [MuxOutAccum7..MuxOutAccum0];
+" ------------------------------------------------------------------------------
+EQUATIONS
+
+Accum.CLK = Clock;                            " use clock input for accum
+Accum.CLR = Reset;                           " use reset input for accum
+
+Flags.CLK = Clock;                            " use clock input for flags
+Flags.CLR = Reset;                           " use reset input for flags
+
+"Mux for the F-Block
+MuxOutAB  = (Op3 & A & B)   #     " Op3 -> 11
+            (Op2 & A & !B)  #     " Op2 -> 10
+            (Op1 & !A & B)  #     " Op1 -> 01
+            (Op0 & !A & !B);      " Op0 -> 00
+
+"Mux for selecting the carry signal into the adder
+MuxOutCarry = (0 & !CarrySel0 & !CarrySel1)   #         " CarrySel=00 -> 0
+              (!Flags3 & !CarrySel0 & CarrySel1)  #  " CarrySel=01 -> !C
+              (Flags3 & CarrySel0 & !CarrySel1)   #  " CarrySel=10 -> C
+              (1 & CarrySel0 & CarrySel1);              " CarrySel=11 -> 1
+
+"Perform an 'AND' operation prior to feeding A into the Adder
+AndResult =  OpAdd & A;
+
+"Adder logic
+Carry0     =  MuxOutCarry;
+Sum        =  (AndResult $ MuxOutAB) $ CarryIn;
+CarryOut   =  ((AndResult $ MuxOutAB) & CarryIn) # (AndResult & MuxOutAB);
+
+
+"Mux for selecting if accumulator value is held or not
+MuxOutAccum = (Sum & !Hold)   #  " !Hold -> pass adder result
+              (Accum & Hold);    " Hold -> keep previous accum value
+
+"Flag computation. Logic is taken from Set 4.
+ZeroFlag   =  !Sum7 & !Sum6 & !Sum5 & !Sum4 & !Sum3 & !Sum2 & !Sum1 & !Sum0;
+CarryFlag  =  (Carry8 $ Subtract) # (Flags3 & prevCarryFlag & !OpAdd);
+Sign       =  Sum7;
+Overflow   =  (Carry8 $ Carry7);
+
+"Assign flags
+"POPF loads data into the flags.
+"When FlagsEN is high, the flags are held (load, store, NOP, PUSHF, jumps)
+"OpAdd=0 for logical operations (S, Z are updated while C, V are kept).
+
+Flags7 :=  (B7 & POPF & FlagsEn) # (Flags7 & !POPF);
+Flags6 :=  0;
+Flags5 :=  (B5 & POPF & FlagsEn) # (Flags5 & !POPF);
+Flags4 :=  0;
+Flags3 := (CarryFlag & !POPF & FlagsEn) # 
+          (B3 & POPF & FlagsEn)         # 
+          (Flags3 & !FlagsEn)           # 
+          (Flags3 & !OpAdd & !POPF & FlagsEn);
+Flags2 := (Overflow & !POPF & FlagsEn)  # 
+          (B2 & POPF & FlagsEn)         # 
+          (Flags2 & !FlagsEn)           # 
+          (Flags2 & !OpAdd & !POPF & FlagsEn);
+Flags1 := (Sign & !POPF & FlagsEn)      #     
+          (B1 & POPF & FlagsEn)         #
+          (Flags1 & !FlagsEn);
+Flags0 := (ZeroFlag & !POPF & FlagsEn)  #
+          (B0 & POPF & FlagsEn)         #
+          (Flags0 & !FlagsEn);
+
+Accum  := MuxOutAccum;
+END ALU
