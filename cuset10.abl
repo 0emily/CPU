@@ -13,7 +13,7 @@ INTERFACE   (Reset, Clock, Flags7..Flags0, ProgramDB15..ProgramDB0
 TITLE       'Control Unit Low-Level'
 
 
-" Description:  This module is the low level file for the Caltech10 CPU control
+" Description:  This module is the low level file for the CPU control
 "               unit. It takes inputs from reset, clock, the Program Data Bus,  
 "               and flags from the algorithmic logic unit (ALU). 
 "               It outputs read, write, IO, and control signals for the ALU,
