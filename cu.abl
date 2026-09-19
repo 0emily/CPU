@@ -1,9 +1,9 @@
 
 MODULE      CPU
-TITLE      'Caltech10 CPU'
+TITLE      'CPU'
 
 
-" Description:  This file implements the Caltech10 CPU.
+" Description:  This file implements the CPU.
 "               It is the top-level module which instantiates and connects
 "               all other modules.
 "
